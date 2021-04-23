@@ -3,6 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/influxdata/influxdb-client-go/v2"
+	vegeta "github.com/tsenart/vegeta/v12/lib"
+	"math/rand"
 	"os"
 	"reflect"
 	"strconv"
@@ -10,17 +13,22 @@ import (
 	"sync"
 	"time"
 	"unsafe"
-
-	"github.com/influxdata/influxdb-client-go/v2"
-	vegeta "github.com/tsenart/vegeta/v12/lib"
 )
 
 func main() {
-	rate := vegeta.Rate{Freq: 1, Per: time.Second}
-	duration := 30 * time.Second
+	//get current time in GMT
+	location, err := time.LoadLocation("GMT")
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	rampUpRate1 := vegeta.Rate{Freq: 500, Per: time.Second}
+	rampUpDuration1 := 300 * time.Second
+	uniqueId := "Vegeta_Client_" + strconv.Itoa(int(rand.Intn(100000000))) + strconv.Itoa(int(time.Now().UnixNano()))
 	// Create map of string slices.
 	requestHeaders := map[string][]string{
-		"Authorization": {"Bearer token"},
+		"Authorization":            {"Bearer token"},
+		"vegeta-client-request-id": {uniqueId},
 	}
 
 	targeter := vegeta.NewStaticTargeter(vegeta.Target{
@@ -29,34 +37,103 @@ func main() {
 		Header: requestHeaders,
 	})
 
-	//set the TimeOut as 300 seconds
-	attacker := vegeta.NewAttacker(vegeta.Timeout(305 * time.Second))
+	/*	set the TimeOut as 1600 seconds
+		set the maximum idle open connections per target host as 1000000
+	*/
+	attacker := vegeta.NewAttacker(vegeta.Timeout(1600*time.Second), vegeta.Connections(10000000))
 
-	var metrics vegeta.Metrics
+	var rampUpMetrics vegeta.Metrics
 	var wg sync.WaitGroup
 
-	for res := range attacker.Attack(targeter, rate, duration, "Big Bang!") {
+	now := time.Now().In(location)
+	line := "----------- Ramp-1 ----------- " + now.String() + " -----------"
+	printSeparator(line, "rampingResponseErrors")
+
+	for ramp1 := range attacker.Attack(targeter, rampUpRate1, rampUpDuration1, "Ramp-1 !!") {
 		wg.Add(1)
-		metrics.Add(res)
+		rampUpMetrics.Add(ramp1)
 		go func(res *vegeta.Result) {
 			defer wg.Done()
 			if res.Code != 200 {
-				printErrorResponse(res)
+				printErrorResponse(res, "rampingResponseErrors")
 			}
-			publishToInfluxDb(res)
-		}(res)
+		}(ramp1)
 	}
-	metrics.Close()
-	wg.Wait()
-	printFinalMetrics(metrics)
 
-	fmt.Printf("99th percentile: %s\n", metrics.Latencies.P99)
+	rampUpRate2 := vegeta.Rate{Freq: 1000, Per: time.Second}
+	rampUpDuration2 := 300 * time.Second
+
+	now = time.Now().In(location)
+	line = "----------- Ramp-2 ----------- " + now.String() + " -----------"
+	printSeparator(line, "rampingResponseErrors")
+
+	for ramp2 := range attacker.Attack(targeter, rampUpRate2, rampUpDuration2, "Ramp-2 !!") {
+		wg.Add(1)
+		rampUpMetrics.Add(ramp2)
+		go func(res *vegeta.Result) {
+			defer wg.Done()
+			if res.Code != 200 {
+				printErrorResponse(res, "rampingResponseErrors")
+			}
+		}(ramp2)
+	}
+
+	rampUpRate3 := vegeta.Rate{Freq: 1500, Per: time.Second}
+	rampUpDuration3 := 300 * time.Second
+
+	now = time.Now().In(location)
+	line = "----------- Ramp-3 ----------- " + now.String() + " -----------"
+	printSeparator(line, "rampingResponseErrors")
+
+	for ramp3 := range attacker.Attack(targeter, rampUpRate3, rampUpDuration3, "Ramp-3 !!") {
+		wg.Add(1)
+		rampUpMetrics.Add(ramp3)
+		go func(res *vegeta.Result) {
+			defer wg.Done()
+			if res.Code != 200 {
+				printErrorResponse(res, "rampingResponseErrors")
+			}
+		}(ramp3)
+	}
+
+	rampUpMetrics.Close()
+	printFinalMetrics(rampUpMetrics, "rampingResult")
+
+	// ------------------------------------------------------------------------------------
+	var loadMetrics vegeta.Metrics
+
+	holdLoadRate := vegeta.Rate{Freq: 1600, Per: time.Second}
+	holdLoadDuration := 1800 * time.Second
+
+	now = time.Now().In(location)
+	line = "----------- Load-1 ----------- " + now.String() + " -----------"
+	printSeparator(line, "loadResponseErrors")
+
+	for load1 := range attacker.Attack(targeter, holdLoadRate, holdLoadDuration, "Load-1 !!") {
+		wg.Add(1)
+		loadMetrics.Add(load1)
+		go func(res *vegeta.Result) {
+			defer wg.Done()
+			if res.Code != 200 {
+				printErrorResponse(res, "loadResponseErrors")
+			}
+			//	publishToInfluxDb(res)
+		}(load1)
+	}
+
+	loadMetrics.Close()
+	wg.Wait()
+	printFinalMetrics(loadMetrics, "loadResults")
+
+	fmt.Printf("rampMetrics: 99th percentile: %s\n", rampUpMetrics.Latencies.P99)
+	fmt.Printf("loadMetrics: 99th percentile: %s\n", loadMetrics.Latencies.P99)
 }
 
-func printFinalMetrics(metric vegeta.Metrics) {
+func printFinalMetrics(metric vegeta.Metrics, fileName string) {
 	metrics, _ := json.MarshalIndent(metric, "", " ")
 	sep := "\n"
-	f, err := os.OpenFile("./finalResult.json", os.O_APPEND|os.O_WRONLY, 0777)
+	fileName = "./" + fileName + ".json"
+	f, err := os.OpenFile(fileName, os.O_TRUNC|os.O_WRONLY, 0777)
 	if err != nil {
 		panic(err)
 	}
@@ -65,9 +142,23 @@ func printFinalMetrics(metric vegeta.Metrics) {
 	_, err = f.WriteString(sep)
 }
 
-func printErrorResponse(res *vegeta.Result) {
+// separate the each ramp up period logs
+func printSeparator(separator string, fileName string) {
 	sep := "\n"
-	f, err := os.OpenFile("./responseErrors.log", os.O_APPEND|os.O_WRONLY, 0777)
+	fileName = "./" + fileName + ".log"
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_WRONLY, 0777)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = f.WriteString(separator)
+	_, err = f.WriteString(sep)
+}
+
+func printErrorResponse(res *vegeta.Result, fileName string) {
+	sep := "\n"
+	fileName = "./" + fileName + ".log"
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_WRONLY, 0777)
 	if err != nil {
 		panic(err)
 	}
